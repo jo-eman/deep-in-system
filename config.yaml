@@ -1,0 +1,156 @@
+---
+- name: Configure and Manage Services Inside VM
+  hosts: localhost
+  become: yes
+  tasks:
+    - name: Set static private IP address
+      ansible.builtin.replace:
+        path: /etc/netplan/01-netcfg.yaml
+        regexp: 'addresses: \[.*\]'
+        replace: "addresses: [192.168.1.10/24]"
+      notify:
+        - Apply network changes
+
+    - name: Test internet connectivity
+      ansible.builtin.ping:
+        count: 5
+        dest: google.com
+
+    - name: Disable remote root login via SSH
+      ansible.builtin.replace:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin yes'
+        replace: 'PermitRootLogin no'
+
+    - name: Change SSH port to 2222
+      ansible.builtin.replace:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port .*'
+        replace: 'Port 2222'
+
+    - name: Configure Firewall
+      ansible.builtin.firewalld:
+        state: enabled
+        immediate: yes
+        zone: public
+        service: "{{ item }}"
+      with_items:
+        - ssh
+      notify:
+        - Reload firewalld
+
+    - name: Create users luffy and zoro
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        home: "{{ item.home }}"
+        shell: /bin/bash
+        password: "{{ item.password | password_hash('sha512') }}"
+        generate_ssh_key: yes
+        ssh_key_file: "{{ item.home }}/.ssh/authorized_keys"
+      with_items:
+        - { name: "luffy", home: "/home/luffy", password: "luffy_password" }
+        - { name: "zoro", home: "/home/zoro", password: "zoro_password" }
+
+    - name: Install FTP server
+      ansible.builtin.package:
+        name: vsftpd
+        state: present
+
+    - name: Configure FTP server
+      ansible.builtin.lineinfile:
+        path: /etc/vsftpd.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^anonymous_enable', line: 'anonymous_enable=NO' }
+        - { regexp: '^local_enable', line: 'local_enable=YES' }
+        - { regexp: '^write_enable', line: 'write_enable=NO' }
+        - { regexp: '^chroot_local_user', line: 'chroot_local_user=YES' }
+        - { regexp: '^userlist_enable', line: 'userlist_enable=YES' }
+        - { regexp: '^userlist_deny', line: 'userlist_deny=NO' }
+        - { regexp: '^userlist_file', line: 'userlist_file=/etc/vsftpd.userlist' }
+      notify:
+        - Restart vsftpd
+
+    - name: Create FTP user nami
+      ansible.builtin.user:
+        name: "nami"
+        home: "/backup"
+        shell: /sbin/nologin
+        password: "{{ 'nami_password' | password_hash('sha512') }}"
+      notify:
+        - Update vsftpd userlist
+
+    - name: Install MySQL server
+      ansible.builtin.package:
+        name: mysql-server
+        state: present
+
+    - name: Configure MySQL
+      ansible.builtin.mysql_user:
+        name: "root"
+        host: localhost
+        password: ""
+        priv: '*.*:ALL,GRANT'
+        state: absent
+
+    - name: Create MySQL user for WordPress
+      ansible.builtin.mysql_user:
+        name: "{{ wordpress_db_user }}"
+        host: localhost
+        password: "{{ wordpress_db_password }}"
+        priv: "{{ wordpress_db_name }}.*:ALL"
+        state: present
+
+    - name: Install WordPress
+      ansible.builtin.get_url:
+        url: "https://wordpress.org/latest.tar.gz"
+        dest: "/tmp/wordpress.tar.gz"
+
+    - name: Extract WordPress
+      ansible.builtin.unarchive:
+        src: "/tmp/wordpress.tar.gz"
+        dest: "{{ wordpress_root }}"
+        remote_src: yes
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Configure WordPress
+      ansible.builtin.template:
+        src: wp-config.php.j2
+        dest: "{{ wordpress_root }}/wp-config.php"
+      notify:
+        - Restart Apache
+
+    - name: Set up WordPress cron job
+      ansible.builtin.cron:
+        name: "backup_wordpress"
+        job: "0 0 * * * tar -cvf /backup/wordpress_backup_$(date +%Y%m%d).tar {{ wordpress_root }}"
+        state: present
+
+    - name: Add log entry for backup
+      ansible.builtin.lineinfile:
+        path: /var/log/backup.log
+        line: "Backup successful at {{ ansible_date_time.iso8601 }}"
+
+  handlers:
+    - name: Apply network changes
+      ansible.builtin.shell: netplan apply
+
+    - name: Restart vsftpd
+      ansible.builtin.service:
+        name: vsftpd
+        state: restarted
+
+    - name: Update vsftpd userlist
+      ansible.builtin.shell: echo "nami" >> /etc/vsftpd.userlist
+
+    - name: Reload firewalld
+      ansible.builtin.firewalld:
+        state: reloaded
+
+    - name: Restart Apache
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
