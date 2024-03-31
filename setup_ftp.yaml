@@ -1,0 +1,89 @@
+---
+- name: Setup FTP server with a read-only user
+  hosts: your_target_group_or_host
+  become: yes
+  vars:
+    ftp_user_name: nami
+    ftp_user_password: "UseYourCustomPassword"  # Change this to your actual password
+    ftp_directory: /backup
+
+  tasks:
+    - name: Install vsftpd
+      apt:
+        name: vsftpd
+        state: present
+        update_cache: yes
+
+    - name: Configure vsftpd
+      blockinfile:
+        path: /etc/vsftpd.conf
+        block: |
+          listen=NO
+          listen_ipv6=YES
+          anonymous_enable=NO
+          local_enable=YES
+          write_enable=NO
+          dirmessage_enable=YES
+          use_localtime=YES
+          xferlog_enable=YES
+          connect_from_port_20=YES
+          chroot_local_user=YES
+          secure_chroot_dir=/var/run/vsftpd/empty
+          pam_service_name=vsftpd
+          rsa_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+          rsa_private_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+          ssl_enable=NO
+          pasv_enable=Yes
+          pasv_min_port=10000
+          pasv_max_port=10100
+          user_sub_token=$USER
+          local_root=/home/$USER/ftp
+          user_config_dir=/etc/vsftpd_user_conf
+      notify: restart vsftpd
+
+    - name: Ensure vsftpd user config directory exists
+      file:
+        path: /etc/vsftpd_user_conf
+        state: directory
+
+    - name: Create FTP user
+      user:
+        name: "{{ ftp_user_name }}"
+        comment: "FTP user {{ ftp_user_name }}"
+        shell: /usr/sbin/nologin
+        password: "{{ ftp_user_password | password_hash('sha512') }}"
+
+    - name: Set up FTP user directory structure
+      file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ ftp_user_name }}"
+        group: "{{ ftp_user_name }}"
+        mode: "{{ item.mode | default(omit) }}"
+      with_items:
+        - { path: "/home/{{ ftp_user_name }}/ftp" }
+        - { path: "{{ ftp_directory }}", mode: "0755", owner: "root", group: "root" }
+
+    - name: Mount /backup to user's FTP directory
+      mount:
+        src: "{{ ftp_directory }}"
+        path: "/home/{{ ftp_user_name }}/ftp"
+        fstype: none
+        opts: bind
+        state: mounted
+      notify: restart vsftpd
+
+    - name: Create user-specific vsftpd config
+      copy:
+        dest: "/etc/vsftpd_user_conf/{{ ftp_user_name }}"
+        content: |
+          local_root={{ ftp_directory }}
+          write_enable=NO
+          allow_writeable_chroot=YES
+      notify: restart vsftpd
+
+  handlers:
+    - name: restart vsftpd
+      service:
+        name: vsftpd
+        state: restarted
